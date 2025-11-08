@@ -1,4 +1,4 @@
-name: Build & Deploy basic web (ECR + SSM)
+name: Build & Deploy basic web
 
 on:
   push:
