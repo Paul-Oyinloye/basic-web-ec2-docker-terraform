@@ -1,64 +1,51 @@
-name: Build & Deploy basic web
+name: CI/CD Deploy
 
 on:
   push:
-    branches: [ "main" ]
-  workflow_dispatch: {}
+    branches: [ main ]
+
+env:
+  AWS_REGION: us-east-1
+  REPO_NAME: basic-web-ec2
 
 jobs:
-  deploy:
+  build_and_deploy:
     runs-on: ubuntu-latest
-    permissions:
-      id-token: write
-      contents: read
 
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Configure AWS credentials (OIDC)
-        uses: aws-actions/configure-aws-credentials@v4
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
         with:
-          aws-region: ${{ secrets.AWS_REGION }}
-          role-to-assume: ${{ secrets.AWS_ROLE }}
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
 
-      - name: Get ECR login
-        id: login-ecr
+      - name: Login to Amazon ECR
+        id: ecr
         uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Ensure ECR repo exists
+      - name: Build, tag, and push Docker image
         run: |
-          aws ecr describe-repositories --repository-names basic-web-ec2 >/dev/null 2>&1 || \
-          aws ecr create-repository --repository-name basic-web-ec2
+          IMAGE_TAG=${{ github.sha }}
+          docker build -t ${{ steps.ecr.outputs.registry }}/${{ env.REPO_NAME }}:$IMAGE_TAG .
+          docker push ${{ steps.ecr.outputs.registry }}/${{ env.REPO_NAME }}:$IMAGE_TAG
+          echo "IMAGE_URI=${{ steps.ecr.outputs.registry }}/${{ env.REPO_NAME }}:$IMAGE_TAG" >> $GITHUB_ENV
 
-      - name: Build & push image to ECR
-        env:
-          REGISTRY: ${{ steps.login-ecr.outputs.registry }}
-          REPO: basic-web-ec2
-          IMAGE_TAG: ${{ github.sha }}
+      - name: Deploy via SSM
         run: |
-          docker build -t $REGISTRY/$REPO:$IMAGE_TAG ./app
-          docker push  -q $REGISTRY/$REPO:$IMAGE_TAG
-          echo "IMAGE_URI=$REGISTRY/$REPO:$IMAGE_TAG" >> $GITHUB_ENV
-
-      - name: Find EC2 instance ID by tag
-        id: find
-        run: |
-          IID=$(aws ec2 describe-instances \
+          INSTANCE_ID=$(aws ec2 describe-instances \
             --filters "Name=tag:Name,Values=basic-web-ec2" "Name=instance-state-name,Values=running" \
             --query "Reservations[0].Instances[0].InstanceId" --output text)
-          if [ "$IID" = "None" ] || [ -z "$IID" ]; then
-            echo "No running instance with tag Name=basic-web-ec2 found"; exit 1
-          fi
-          echo "INSTANCE_ID=$IID" >> $GITHUB_ENV
 
-      - name: Deploy via SSM (pull & run container)
-        run: |
           aws ssm send-command \
             --instance-ids "$INSTANCE_ID" \
             --document-name "AWS-RunShellScript" \
-            --comment "Restart web container" \
-            --parameters commands="sudo docker pull $IMAGE_URI; \
-              sudo docker rm -f webapp || true; \
-              sudo docker run -d --name webapp -p 80:80 --restart=always $IMAGE_URI" \
+            --comment "Deploy updated web app container" \
+            --parameters commands="aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin ${{ steps.ecr.outputs.registry }}; \
+              docker pull $IMAGE_URI; \
+              docker rm -f webapp || true; \
+              docker run -d --name webapp --restart=always -p 80:80 $IMAGE_URI" \
             --output text
