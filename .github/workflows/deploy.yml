@@ -1,51 +1,74 @@
-name: CI/CD Deploy
+name: CI/CD Deploy (OIDC)
 
 on:
   push:
     branches: [ main ]
 
+permissions:
+  id-token: write
+  contents: read
+
 env:
-  AWS_REGION: us-east-1
+  AWS_REGION: ${{ secrets.AWS_REGION }}
   REPO_NAME: basic-web-ec2
 
 jobs:
-  build_and_deploy:
+  deploy:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v2
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
         with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          role-to-assume: ${{ secrets.AWS_ROLE }}
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Login to Amazon ECR
         id: ecr
         uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Build, tag, and push Docker image
+      - name: Ensure ECR repo exists
         run: |
-          IMAGE_TAG=${{ github.sha }}
-          docker build -t ${{ steps.ecr.outputs.registry }}/${{ env.REPO_NAME }}:$IMAGE_TAG .
-          docker push ${{ steps.ecr.outputs.registry }}/${{ env.REPO_NAME }}:$IMAGE_TAG
-          echo "IMAGE_URI=${{ steps.ecr.outputs.registry }}/${{ env.REPO_NAME }}:$IMAGE_TAG" >> $GITHUB_ENV
+          aws ecr describe-repositories --repository-names "$REPO_NAME" >/dev/null 2>&1 || \
+          aws ecr create-repository --repository-name "$REPO_NAME"
 
-      - name: Deploy via SSM
+      - name: Build & push image
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
         run: |
-          INSTANCE_ID=$(aws ec2 describe-instances \
+          # Build from ./app so your updated index.html is included
+          docker build -t "$REGISTRY/$REPO_NAME:$IMAGE_TAG" ./app
+          docker push "$REGISTRY/$REPO_NAME:$IMAGE_TAG"
+          echo "IMAGE_URI=$REGISTRY/$REPO_NAME:$IMAGE_TAG" >> $GITHUB_ENV
+
+      - name: Who am I (debug)
+        run: aws sts get-caller-identity
+
+      - name: Find EC2 by tag
+        run: |
+          IID=$(aws ec2 describe-instances \
             --filters "Name=tag:Name,Values=basic-web-ec2" "Name=instance-state-name,Values=running" \
             --query "Reservations[0].Instances[0].InstanceId" --output text)
+          if [ -z "$IID" ] || [ "$IID" = "None" ]; then
+            echo "No running instance with tag Name=basic-web-ec2"; exit 1
+          fi
+          echo "INSTANCE_ID=$IID" >> $GITHUB_ENV
 
+      - name: Deploy via SSM (pull & run)
+        run: |
           aws ssm send-command \
             --instance-ids "$INSTANCE_ID" \
             --document-name "AWS-RunShellScript" \
             --comment "Deploy updated web app container" \
-            --parameters commands="aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin ${{ steps.ecr.outputs.registry }}; \
-              docker pull $IMAGE_URI; \
-              docker rm -f webapp || true; \
+            --parameters commands="set -eux
+              # Login to ECR on the host
+              aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin ${{ steps.ecr.outputs.registry }};
+              # Pull the new image
+              docker pull $IMAGE_URI;
+              # Replace the container
+              docker rm -f webapp || true;
               docker run -d --name webapp --restart=always -p 80:80 $IMAGE_URI" \
             --output text
